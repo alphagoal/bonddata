@@ -1,0 +1,193 @@
+import pandas as pd
+import os, time
+import xlwings as xw
+from openpyxl import load_workbook, Workbook
+try:
+    import requests
+except:
+    os.system("python -m pip install requests --user")
+    import requests
+try:
+    import pyodbc
+except:
+    os.system("python -m pip install pyodbc --user")
+    import pyodbc
+
+def load_date(start_date, end_date):
+    date_list = [i.strftime("%Y-%m-%d") for i in pd.date_range(start_date, end_date, freq='M')]
+    date_list.reverse()
+    return date_list
+
+def format_data(data):
+    temp_time = ""
+    temp_data_list = []
+    result = []
+    for data_point in data:
+        if data_point[2] != temp_time:
+            if temp_data_list != []:
+                result.append(temp_data_list)
+            temp_time = data_point[2]
+            temp_data_list = []
+            temp_data_list.append(data_point[2])
+        temp_data_list.append(data_point[1]/100)
+    result.append(temp_data_list)
+
+    col = [str(int(x)) + "Y" for x in pd.DataFrame(data).iloc[:len(result[0])-1, 0].values.tolist()]
+    col.insert(0, "Date_Time")
+
+    result_df = pd.DataFrame(result, columns=col)
+    return result_df
+
+def direct_scrap(date_list, URL):
+    final_result = []
+    for date in date_list:
+        count = 0
+        while True:
+            count += 1
+            if count > 10:
+                break
+            try:
+                post_URL = URL.format(date)
+                post = requests.post(post_URL)
+                data = post.json()[0]['seriesData']
+                tmp_result = pd.DataFrame(data)[[float(i).is_integer() for i in pd.DataFrame(data).iloc[:, 0]]]
+                tmp_result[2] = date
+                final_result.extend(tmp_result.reset_index(drop=True).values.tolist())
+                print("Downloaded data at " + date)
+                break
+            except IndexError:
+                print("No data for " + date)
+                day = int(date.split("-")[2])
+                day -= 1
+                date = '-'.join([date.split("-")[0], date.split("-")[1], str(day)])
+                print("Trying to download data at " + date)
+    return final_result
+
+def write_to_excel(data, result_cols, write_mode, rating, output_file_name):
+    if write_mode == "append":
+        try:
+            original_data = pd.read_excel(os.path.join(os.path.dirname(__file__), output_file_name), rating)
+        except ValueError:
+            print("No original data, read Excel passed...")
+            original_data = pd.DataFrame(columns=result_cols)
+    else:
+        original_data = pd.DataFrame(columns=result_cols)
+    while True:
+        try:
+            with pd.ExcelWriter(os.path.join(os.path.dirname(__file__), output_file_name), engine="openpyxl", mode='a', if_sheet_exists="replace") as writer:
+                result = pd.concat([original_data, data.loc[:, [i for i in data.columns.tolist() if i in result_cols]]]).sort_values(by=["Date_Time"], ascending=False)
+                result.fillna("#N/A").to_excel(writer, sheet_name=rating, index=False)
+            break
+        except PermissionError:
+            print("Permission denied: " + os.path.join(os.path.dirname(__file__), output_file_name))
+            time.sleep(5)
+    print(result.fillna("#N/A").reset_index(drop=True))
+    print(f"Write to `{os.path.join(os.path.dirname(__file__), output_file_name)}` tab `{rating}` successfully")
+
+def upload_to_db(data, result_cols, db_name, write_mode, rating):
+    conn_str = (
+        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+        rf'DBQ={os.path.join(os.path.dirname(__file__), db_name)};'
+    )
+
+    connection = pyodbc.connect(conn_str, autocommit=True)
+    cursor = connection.cursor()
+
+    if write_mode != "append":
+        del_sql = f"DELETE FROM `{rating}`"
+        cursor.execute(del_sql)
+
+    result = pd.DataFrame(columns=result_cols)
+    result = pd.concat([result, data.loc[:, [i for i in data.columns.tolist() if i in result_cols]]])
+
+    field_names = ", ".join(result_cols)
+    values = ", ".join(["?" for i in range(len(result_cols))])
+    sql = f"INSERT INTO `{rating}` ({field_names}) VALUES ({values})"
+    for row in data.values.tolist():
+        try:
+            cursor.execute(sql, row)
+        except pyodbc.IntegrityError:
+            print(f"Duplicated date ({row[0]}), entry passed without inserting")
+    cursor.close()
+    print.info("Uploaded to Table " + rating)
+
+def scrapping(date_list, write_mode, URL_dict, output_file_name, upload_to_access, db_name, result_cols):
+    # Create workbook if not exist
+    if not os.path.exists(os.path.join(os.path.dirname(__file__), output_file_name)):
+        Workbook().save(os.path.join(os.path.dirname(__file__), output_file_name))
+
+    # Perform scrapping
+    for rating in list(URL_dict.keys()):
+        print("Downloading data for " + rating + "...")
+        URL = URL_dict[rating]
+        final_results = format_data(direct_scrap(date_list, URL))
+        write_to_excel(final_results, result_cols, write_mode, rating, output_file_name)
+        
+        if upload_to_access:
+            upload_to_db(final_results, result_cols, db_name, write_mode)
+
+    # Delete tabs that are not in the scope
+    result_tabs = list(URL_dict.keys())
+    wb = load_workbook(os.path.join(os.path.dirname(__file__), output_file_name))
+    for tab in wb.sheetnames:
+        if tab not in result_tabs:
+            wb.remove(wb[tab])
+    wb.save(os.path.join(os.path.dirname(__file__), output_file_name))
+
+def format_run_no(run_no):
+    range_list = [i.strip() for i in run_no.split(",")]
+    result = []
+    for range_item in range_list:
+        no = range_item.split("-")
+        start = int(no[0])-1
+        if len(no) == 1:
+            end = int(no[0])
+        else:
+            end = int(no[1])
+        result.extend(list(range(start, end)))
+    return result
+
+def main():
+    wb = xw.Book.caller()
+    ws = wb.sheets["Run Control"]
+    run_no = ws["Run_No"].value
+    start_date = ws["start_date"].value
+    end_date = ws["end_date"].value
+    append_mode = ws["append_mode"].value
+    output_file_name = ws["output_filename"].value
+    upload_to_access = ws["upload_to_access"].value
+    db_name = ws["db_name"].value
+    result_cols_str = ws["result_cols"].value
+    URLs_df = wb.sheets['URLs']["A1"].expand().options(pd.DataFrame, header=1, index=False).value
+    URL_dict = URLs_df.iloc[format_run_no(run_no), :].set_index('Rating', drop=True)['URL'].to_dict()
+    
+    date_list = load_date(start_date, end_date)
+    if append_mode:
+        write_mode = "append"
+    else:
+        write_mode = "override"
+    result_cols = [i.strip() for i in result_cols_str.split(",")]
+    scrapping(date_list, write_mode, URL_dict, output_file_name, upload_to_access, db_name, result_cols)
+    
+
+# For manual run only
+if __name__ == "__main__":
+    # Specifying the start_date and end_date of the period that needs to download data. Note that the frequency of the time interval is 'Month'
+    date_list = load_date("2023-01-31", "2023-11-30")
+    # Specifying the writting mode for the Excel output
+    # `append` keeps the original data, `override` deletes the original data
+    write_mode = "append"
+    # Read `Run Control.xlsm` tab `URLs` for the ratings and URL input
+    # By default it is located in the same folder of this script
+    URLs_file_name = "Run Control.xlsm"
+    URL_dict = pd.read_excel(os.path.join(os.path.dirname(__file__), URLs_file_name), "URLs").set_index('Rating', drop=True)['URL'].to_dict()
+    # Define the output Excel file name
+    # By default it is located in the same folder of this script
+    output_file_name = "Yield Data_v3_2023Dec.xlsx"
+    # Define whether to upload to Access Database
+    upload_to_access = False # !!!!!!!!!!!! set to false first until access is available for use !!!!!!!!!!!!
+    # Set the name for Access Database
+    db_name = "Yield Data.accdb"
+    # Define which columns (tenors) are needed for the output result dataframe
+    result_cols = ["Date_Time", "0Y", "0.0833Y", "0.25Y", "0.5Y", "0.75Y", "1Y", "2Y", "3Y", "4Y", "5Y", "6Y", "7Y", "8Y", "9Y", "10Y", "15Y", "20Y", "30Y"]
+    scrapping(date_list, write_mode, URL_dict, output_file_name, upload_to_access, db_name, result_cols)
